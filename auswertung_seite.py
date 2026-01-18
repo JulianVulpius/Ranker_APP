@@ -39,6 +39,68 @@ EVENT_NAME_MAP = {val[0]: val[1].replace(' Start', '').replace(' Ende', '') for 
 # HILFSFUNKTIONEN (BERECHNUNGEN)
 # --------------------------
 
+# --------------------------
+# LOGIK-FUNKTIONEN 
+# --------------------------
+
+def calculate_dynamic_threshold(values, factor=0.5):
+    """Berechnet einen relativen Toleranzwert (Standardabweichung * Faktor)."""
+    if len(values) < 2: return 0.001
+    return np.std(values) * factor
+
+def get_strict_ranking_order(df, metric):
+    """
+    Erstellt eine Liste von Items basierend auf strikter numerischer Sortierung.
+    Der Threshold wird ignoriert; der höchste Wert steht immer oben (Platz 1).
+    """
+    # Sortieren nach Wert absteigend
+    df_sorted = df.sort_values(by=metric, ascending=False).copy()
+    items = df_sorted['Phase'].values
+    
+    return items.tolist()
+
+def get_sehr_fair_ranking_order(df, metric, user_ranking_list, threshold):
+    """
+    Sortiert die EEG-Items so um, dass sie dem User-Ranking möglichst nahe kommen,
+    sofern die physiologische Differenz innerhalb der Toleranz liegt.
+    """
+    # Mapping User-Ranking: Item -> Rang (0-basiert)
+    user_rank_map = {item: i for i, item in enumerate(user_ranking_list)}
+    
+    # Daten vorbereiten
+    df_sorted = df.sort_values(by=metric, ascending=False).copy()
+    values = df_sorted[metric].values
+    items = df_sorted['Phase'].values
+    
+    # Optimierte Liste initialisieren (mit Platzhaltern)
+    optimized_items = [None] * len(items)
+    processed_indices = set()
+    
+    i = 0
+    while i < len(values):
+        # Cluster finden (Werte innerhalb Threshold)
+        cluster_indices = [i]
+        j = i + 1
+        while j < len(values) and abs(values[i] - values[j]) < threshold:
+            cluster_indices.append(j)
+            j += 1
+            
+        # Items im Cluster
+        cluster_item_names = [items[idx] for idx in cluster_indices]
+        
+        # Sortieren dieser Items nach ihrem Rang im User-Ranking (Best Match Logic)
+        # Items, die nicht im User-Ranking sind, kommen ans Ende des Clusters
+        cluster_item_names.sort(key=lambda x: user_rank_map.get(x, 999))
+        
+        # In die Ergebnisliste schreiben
+        for k, item_name in enumerate(cluster_item_names):
+            # Der Slot im Gesamtranking entspricht dem Startindex des Clusters + k
+            optimized_items[i + k] = item_name
+            
+        i = j # Sprung zum nächsten Cluster
+        
+    return optimized_items
+
 def validate_columns(df, required_cols, file_name):
     """Prüft, ob alle notwendigen Spalten im DataFrame vorhanden sind."""
     df.columns = df.columns.str.strip()
@@ -138,12 +200,16 @@ def get_global_events(playlist_df):
             
     return long_events, transitions, short_events
 
-def clean_segment_with_context(segment, cleaning_level, short_event_seconds, global_long, global_trans, global_short):
+def clean_segment_with_context(segment, cleaning_level, short_event_seconds, reaction_buffer, global_long, global_trans, global_short):
     if cleaning_level == 'Ohne' or segment.empty: return segment
     indices_to_drop = set()
     seg_start, seg_end = segment.index.min(), segment.index.max()
     
+    # Umrechnung Sekunden in Samples (Zeilen)
+    buffer_rows = int(reaction_buffer * SAMPLING_FREQUENCY)
+    
     # LEVEL: NORMAL (Basis-Bereinigung: Nur Transitions entfernen)
+    # Transitions bleiben strikt (Start bis Ende), da diese keine "unerwarteten" Events sind
     if cleaning_level in ['Normal', 'Strikt', 'Sehr Strikt']:
         for start, end, _ in global_trans:
             if start <= seg_end and end >= seg_start:
@@ -152,19 +218,25 @@ def clean_segment_with_context(segment, cleaning_level, short_event_seconds, glo
                 indices_to_drop.update(segment.loc[drop_start:drop_end].index)
     
     # LEVEL: STRIKT (Normal + Lange Events)
+    # Hier wird der Startpunkt um den Reaktions-Puffer nach vorne verlegt
     if cleaning_level in ['Strikt', 'Sehr Strikt']:
         for start, end, _ in global_long:
             if start <= seg_end and end >= seg_start:
-                drop_start = max(start, seg_start)
+                # Puffer anwenden: Startpunkt liegt früher (links auf Zeitachse)
+                adjusted_start = start - buffer_rows
+                
+                drop_start = max(adjusted_start, seg_start)
                 drop_end = min(end, seg_end)
                 indices_to_drop.update(segment.loc[drop_start:drop_end].index)
 
     # LEVEL: SEHR STRIKT (Strikt + Kurze Events)
+    # Hier wird der Puffer additiv auf den Radius für die linke Seite angewendet
     if cleaning_level == 'Sehr Strikt':
         rows_to_cut = int(short_event_seconds * SAMPLING_FREQUENCY)
         for idx, _ in global_short:
             if seg_start <= idx <= seg_end:
-                drop_start = max(seg_start, idx - rows_to_cut)
+                # Links: Radius + Puffer | Rechts: Nur Radius
+                drop_start = max(seg_start, idx - (rows_to_cut + buffer_rows))
                 drop_end = min(seg_end, idx + rows_to_cut)
                 indices_to_drop.update(segment.loc[drop_start:drop_end].index)
                 
@@ -282,16 +354,21 @@ def persist_uploaded_file(upload_obj, key):
 # REPORT GENERATOR 
 # --------------------------
 
-def generate_html_report(results_collection, short_event_seconds, participant_id):
+def generate_html_report(results_collection, short_event_seconds, reaction_buffer, participant_id):
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    
+    # Berechne Gesamtzeit links für die Info
+    total_left_cut = short_event_seconds + reaction_buffer
+    
     logic_desc = f"""
     <div style="background: #eef; padding: 10px; border-left: 4px solid #44a; margin-bottom: 20px; font-size: 0.9em;">
         <strong>Angewandte Reinigungs-Logik:</strong><br>
         <ul>
-            <li><b>Ohne:</b> Keine Reinigung und nur Segmentierung der Songs. (Start bis Ende der Playlist.)</li>
-            <li><b>Normal:</b> Entfernt <u>Transitionen</u> (Übergangsphasen zwischen Songs).</li>
-            <li><b>Strikt:</b> Entfernt Transitionen + <u>Lange Störungen</u> (Visuell/Auditiv/Bewegung).</li>
-            <li><b>Sehr Strikt:</b> Entfernt Transitionen + Lange Events + <u>Kurze Störungen</u> (Reinigungsradius bei kurzen Events: {short_event_seconds}s).</li>
+            <li><b>Ohne:</b> Keine Reinigung und nur Segmentierung der Songs.</li>
+            <li><b>Normal:</b> Entfernt Transitionen.</li>
+            <li><b>Strikt:</b> Entfernt Transitionen + Lange Störungen (Startpunkt um {reaction_buffer}s vorverlegt).</li>
+            <li><b>Sehr Strikt:</b> Entfernt Transitionen + Lange Störungen + Kurze Störungen.<br>
+            <i>(Schnitt bei Kurz-Events: {total_left_cut}s Vergangenheit [Radius {short_event_seconds}s + Puffer {reaction_buffer}s] bis {short_event_seconds}s Zukunft)</i>.</li>
         </ul>
     </div>
     """
@@ -325,7 +402,8 @@ def generate_html_report(results_collection, short_event_seconds, participant_id
             <strong>Teilnehmer ID:</strong> {participant_id}<br>
             <strong>Erstellt am:</strong> {now_str}<br>
             <strong>Enthaltene Level:</strong> {', '.join(results_collection.keys())}<br>
-            <strong>Kurze Events-Radius:</strong> {short_event_seconds} Sek.
+            <strong>Kurze Events-Radius:</strong> {short_event_seconds} Sek.<br>
+            <strong>Reaktions-Puffer (Rückwirkend):</strong> {reaction_buffer} Sek.
         </div>
         {logic_desc}
     """
@@ -438,8 +516,8 @@ def display_auswertung_page():
     if 'stored_youtube' not in st.session_state: st.session_state.stored_youtube = None
     if 'stored_audio1' not in st.session_state: st.session_state.stored_audio1 = None
     if 'stored_audio2' not in st.session_state: st.session_state.stored_audio2 = None
-    if 'stored_audio3' not in st.session_state: st.session_state.stored_audio3 = None # NEU
-    if 'stored_audio4' not in st.session_state: st.session_state.stored_audio4 = None # NEU
+    if 'stored_audio3' not in st.session_state: st.session_state.stored_audio3 = None 
+    if 'stored_audio4' not in st.session_state: st.session_state.stored_audio4 = None 
     if 'stored_ranking_csv' not in st.session_state: st.session_state.stored_ranking_csv = None
     
     if 'analysis_results' not in st.session_state:
@@ -580,39 +658,195 @@ def display_auswertung_page():
             info_cols[1].markdown(f"**Operationen:** `{global_ops}`")
             info_cols[1].markdown(f"**Musikeffekt:** `{global_music_fx}`")
 
+    # --------------------------
+    # RANKING CSV MERGER TOOL 
+    # --------------------------
+    with st.expander("🛠️ Ranking CSV Merger Tool (Dateien zusammenfügen)", expanded=False):
+        st.info("Hier kannst du mehrere exportierte Ranking-CSVs zu einer einzigen Datei zusammenfügen.")
+        merge_files = st.file_uploader("CSV-Dateien zum Zusammenfügen auswählen", type="csv", accept_multiple_files=True, key="merge_uploader")
+        
+        if merge_files:
+            merge_dfs = []
+            merge_filenames = [] # Zum Zuordnen von Fehlern/Hinweisen
+            parse_error = False
+            
+            # Dictionary zum Speichern, welcher Typ in welcher Datei vorkommt
+            ranking_type_sources = {}
+            
+            # 1. Erfassen der Dateien
+            for f in merge_files:
+                try:
+                    f.seek(0)
+                    tmp_df = pd.read_csv(f)
+                    tmp_df.columns = tmp_df.columns.str.strip()
+
+                    if 'ranking_type' not in tmp_df.columns:
+                        st.error(f"❌ Datei '{f.name}' ist ungültig (keine 'ranking_type' Spalte).")
+                        parse_error = True
+                    else:
+                        merge_dfs.append(tmp_df)
+                        merge_filenames.append(f.name)
+                        
+                        types_in_file = tmp_df['ranking_type'].dropna().unique()
+                        for rt in types_in_file:
+                            if rt not in ranking_type_sources:
+                                ranking_type_sources[rt] = []
+                            ranking_type_sources[rt].append(f.name)
+                            
+                except Exception as e:
+                    st.error(f"❌ Fehler beim Lesen von '{f.name}': {e}")
+                    parse_error = True
+            
+            if not parse_error and merge_dfs:
+                
+                # --- SPALTEN HARMONISIERUNG ---
+                all_columns = set()
+                for df in merge_dfs:
+                    all_columns.update(df.columns)
+                
+                filled_columns_report = []
+                
+                for i, df in enumerate(merge_dfs):
+                    missing_cols = list(all_columns - set(df.columns))
+                    if missing_cols:
+                        # Fehlende Spalten mit "N/A" auffüllen
+                        for col in missing_cols:
+                            df[col] = "N/A"
+                        filled_columns_report.append(f"**{merge_filenames[i]}**: Wurde ergänzt um {missing_cols}")
+                
+                if filled_columns_report:
+                    st.warning("⚠️ **Hinweis zur Struktur:** Nicht alle Dateien hatten dieselben Spalten. Fehlende Werte wurden automatisch mit 'N/A' aufgefüllt.")
+                    with st.expander("Details zu ergänzten Spalten anzeigen"):
+                        for report in filled_columns_report:
+                            st.markdown(f"- {report}")
+
+                # 2. Analyse auf Konflikte
+                all_ids = set()
+                all_meds = set()
+                all_ops = set()
+                all_music = set()
+                
+                for df in merge_dfs:
+                    if 'participant_id' in df.columns:
+                        all_ids.update(df['participant_id'].dropna().astype(str).unique())
+                    if 'global_medikamente' in df.columns:
+                        all_meds.update(df['global_medikamente'].dropna().astype(str).unique())
+                    if 'global_operationen' in df.columns:
+                        all_ops.update(df['global_operationen'].dropna().astype(str).unique())
+                    if 'global_musikeffekt' in df.columns:
+                        all_music.update(df['global_musikeffekt'].dropna().astype(str).unique())
+
+                # 3. Validierung & UI für Konfliktlösung
+                block_merge = False
+                
+                # A) Ranking Types Konflikt (BLOCKER)
+                duplicate_conflicts = {rt: files for rt, files in ranking_type_sources.items() if len(files) > 1}
+                
+                if duplicate_conflicts:
+                    st.error("⛔ **Konflikt: Doppelte Ranking-Typen erkannt!**")
+                    st.markdown("Das Zusammenfügen ist nicht möglich, da folgende Typen in mehreren Dateien gleichzeitig vorkommen:")
+                    for r_type, files in duplicate_conflicts.items():
+                        st.markdown(f"- Ranking-Typ `{r_type}` gefunden in: **{', '.join(files)}**")
+                    block_merge = True
+
+                # B) Participant ID Konflikt
+                final_id = list(all_ids)[0] if all_ids else "Unbekannt"
+                if len(all_ids) > 1:
+                    st.error(f"⚠️ **Konflikt: Unterschiedliche Teilnehmer-IDs gefunden:** {', '.join(all_ids)}")
+                    final_id = st.selectbox("Welche ID soll für die gemergte Datei verwendet werden?", list(all_ids), key="sel_merge_id")
+                
+                # C) Meds & Ops Konflikt
+                final_meds = list(all_meds)[0] if all_meds else "N/A"
+                if len(all_meds) > 1:
+                    st.error(f"⚠️ **Konflikt: Unterschiedliche Angaben zu Medikamenten:**")
+                    final_meds = st.selectbox("Welche Angabe soll übernommen werden (Medikamente)?", list(all_meds), key="sel_merge_meds")
+
+                final_ops = list(all_ops)[0] if all_ops else "N/A"
+                if len(all_ops) > 1:
+                    st.error(f"⚠️ **Konflikt: Unterschiedliche Angaben zu Operationen:**")
+                    final_ops = st.selectbox("Welche Angabe soll übernommen werden (Operationen)?", list(all_ops), key="sel_merge_ops")
+
+                # D) Music Effect Warnung
+                final_music = list(all_music)[0] if all_music else "Nein"
+                if len(all_music) > 1:
+                    st.warning(f"⚠️ **Hinweis:** Unterschiedliche Angaben zum Musikeffekt gefunden ({', '.join(all_music)}).")
+                    final_music = st.selectbox("Welche Angabe soll übernommen werden (Musikeffekt)?", list(all_music), key="sel_merge_music")
+
+                # 4. Erstellung
+                if not block_merge:
+                    merged_df = pd.concat(merge_dfs, ignore_index=True)
+                    
+                    # Metadaten überschreiben
+                    if 'participant_id' in merged_df.columns:
+                        merged_df['participant_id'] = final_id
+                    if 'global_medikamente' in merged_df.columns:
+                        merged_df['global_medikamente'] = final_meds
+                    if 'global_operationen' in merged_df.columns:
+                        merged_df['global_operationen'] = final_ops
+                    if 'global_musikeffekt' in merged_df.columns:
+                        merged_df['global_musikeffekt'] = final_music
+                    
+                    # --- SORTIERLOGIK ---
+                    sort_order = ['audio_1', 'audio_2', 'audio_3', 'audio_4', 'youtube']
+                    order_map = {key: i for i, key in enumerate(sort_order)}
+                    
+                    # Temporäre Hilfsspalte für Sortierung
+                    merged_df['__sort_helper'] = merged_df['ranking_type'].map(order_map).fillna(len(sort_order))
+                    
+                    # Sortieren und Hilfsspalte entfernen
+                    merged_df = merged_df.sort_values(by=['__sort_helper', 'play_order']).drop(columns=['__sort_helper'])
+
+                    # CSV Generierung
+                    csv_data = merged_df.to_csv(index=False).encode('utf-8')
+                    file_name_merged = f"export_{final_id}_merged.csv"
+                    
+                    st.markdown("###")
+                    st.success(f"✅ Bereit zum Download! ({len(merged_df)} Einträge aus {len(merge_dfs)} Dateien, sortiert)")
+                    
+                    st.download_button(
+                        label="📥 Zusammenfügen & Herunterladen",
+                        data=csv_data,
+                        file_name=file_name_merged,
+                        mime='text/csv',
+                        type="primary",
+                        width='stretch'
+                    )
+
     st.markdown("---"); st.subheader("2. EEG-Aufnahmen hochladen")
     
     # --- EEG UPLOADS ---
     
-    # Baseline
+    # Baseline (Alleine)
     raw_bl = st.file_uploader("Grundaktivität (Baseline) EEG-Aufnahme", type="csv", key="up_bl")
     file_bl = persist_uploaded_file(raw_bl, 'stored_baseline')
     if file_bl and raw_bl is None: st.success(f"✅ Baseline geladen: {file_bl.name}")
     
-    cols = st.columns(3)
-    
-    # Playlists 1 & 2
-    raw_yt = cols[0].file_uploader("YouTube Playlist EEG", type="csv", key="up_yt")
+    # YouTube (Alleine in einer "Zeile")
+    raw_yt = st.file_uploader("YouTube Playlist EEG", type="csv", key="up_yt")
     file_yt = persist_uploaded_file(raw_yt, 'stored_youtube')
-    if file_yt and raw_yt is None: cols[0].success(f"✅ Datei geladen: {file_yt.name}")
+    if file_yt and raw_yt is None: st.success(f"✅ Datei geladen: {file_yt.name}")
+
+    # Audio 1 & 2 (Nebeneinander)
+    cols_audio_12 = st.columns(2)
     
-    raw_a1 = cols[1].file_uploader("Audio 1 Playlist EEG", type="csv", key="up_a1")
+    raw_a1 = cols_audio_12[0].file_uploader("Audio 1 Playlist EEG", type="csv", key="up_a1")
     file_a1 = persist_uploaded_file(raw_a1, 'stored_audio1')
-    if file_a1 and raw_a1 is None: cols[1].success(f"✅ Datei geladen: {file_a1.name}")
+    if file_a1 and raw_a1 is None: cols_audio_12[0].success(f"✅ Datei geladen: {file_a1.name}")
 
-    raw_a2 = cols[2].file_uploader("Audio 2 Playlist EEG", type="csv", key="up_a2")
+    raw_a2 = cols_audio_12[1].file_uploader("Audio 2 Playlist EEG", type="csv", key="up_a2")
     file_a2 = persist_uploaded_file(raw_a2, 'stored_audio2')
-    if file_a2 and raw_a2 is None: cols[2].success(f"✅ Datei geladen: {file_a2.name}")
+    if file_a2 and raw_a2 is None: cols_audio_12[1].success(f"✅ Datei geladen: {file_a2.name}")
 
-    # Playlists 3 & 4 (Shuffled)
-    cols_shuffled = st.columns(2)
-    raw_a3 = cols_shuffled[0].file_uploader("Audio 3 (Shuffled) Playlist EEG", type="csv", key="up_a3")
+    # Playlists 3 & 4 (Nebeneinander)
+    cols_audio_34 = st.columns(2)
+    
+    raw_a3 = cols_audio_34[0].file_uploader("Audio 3 (Shuffled) Playlist EEG", type="csv", key="up_a3")
     file_a3 = persist_uploaded_file(raw_a3, 'stored_audio3')
-    if file_a3 and raw_a3 is None: cols_shuffled[0].success(f"✅ Datei geladen: {file_a3.name}")
+    if file_a3 and raw_a3 is None: cols_audio_34[0].success(f"✅ Datei geladen: {file_a3.name}")
 
-    raw_a4 = cols_shuffled[1].file_uploader("Audio 4 (Shuffled) Playlist EEG", type="csv", key="up_a4")
+    raw_a4 = cols_audio_34[1].file_uploader("Audio 4 (Shuffled) Playlist EEG", type="csv", key="up_a4")
     file_a4 = persist_uploaded_file(raw_a4, 'stored_audio4')
-    if file_a4 and raw_a4 is None: cols_shuffled[1].success(f"✅ Datei geladen: {file_a4.name}")
+    if file_a4 and raw_a4 is None: cols_audio_34[1].success(f"✅ Datei geladen: {file_a4.name}")
 
     # Mapping für Verarbeitung
     eeg_files_processing = {
@@ -625,12 +859,21 @@ def display_auswertung_page():
     
     st.markdown("---"); st.subheader("3. Einstellungen")
     
-    col_settings, _ = st.columns([1, 2])
-    with col_settings:
+    # Einstellungen nebeneinander (2 Spalten)
+    col_set_1, col_set_2 = st.columns(2)
+    
+    with col_set_1:
         short_event_seconds = st.number_input(
             "Zeitfenster für 'kurze' Events (in Sekunden)", 0.5, 10.0, 2.5, 0.5,
-            help="Wegschneidezeitraum in beide Richtungen für kurze Events (z.B. Husten). Bei 2.5s werden 2.5s vor und 2.5s nach dem Event aus den Daten entfernt."
+            help="Wegschneidezeitraum in beide Richtungen für kurze Events (z.B. Husten)."
         )
+        
+    with col_set_2:
+        reaction_buffer = st.number_input(
+            "Reaktions-Puffer (in Sekunden)", 0.0, 5.0, 1.0, 0.5,
+            help="Erweitert den Ausschnitt rückwirkend (in die Vergangenheit). Beispiel: Bei einem kurzen Event von 2,5s Radius und 1s Puffer wird 3,5s vor dem Trigger und 2,5s nach dem Trigger geschnitten. Bei langen Events wird der Startpunkt um diesen Wert vorverlegt."
+        )
+
     st.markdown("---")
     
     eeg_dataframes = {}
@@ -700,7 +943,7 @@ def display_auswertung_page():
     can_start = (not validation_errors) and ('baseline' in eeg_dataframes) and (len(eeg_dataframes) > 1) and (not user_ranking_df.empty)
     
     if can_start:
-        if st.button("Analyse starten (Alle Reinigungs-Level)", type="primary", use_container_width=True):
+        if st.button("Analyse starten (Alle Reinigungs-Level)", type="primary", width='stretch'):
             results_collection = {}
             with st.spinner("Analysiere Daten für alle Reinigungs-Stufen..."):
                 for cleaning_level in CLEANING_LEVELS:
@@ -709,7 +952,8 @@ def display_auswertung_page():
                     b_starts = baseline_df[baseline_df['TRIG'] == 1].index; b_ends = baseline_df[baseline_df['TRIG'] == 2].index
                     bl_long, bl_trans, bl_short = get_global_events(baseline_df)
                     raw_baseline_segment = baseline_df.iloc[b_starts[0]:b_ends[0]]
-                    cleaned_baseline_segment = clean_segment_with_context(raw_baseline_segment, cleaning_level, short_event_seconds, bl_long, bl_trans, bl_short)
+                    
+                    cleaned_baseline_segment = clean_segment_with_context(raw_baseline_segment, cleaning_level, short_event_seconds, reaction_buffer, bl_long, bl_trans, bl_short)
 
                     if cleaned_baseline_segment.empty:
                         baseline_result = {'Phase': 'Grundaktivität', 'Alpha/Beta Verhältnis': 0.0, 'Theta/Beta Verhältnis': 0.0, '(Alpha+Theta)/Beta Verhältnis': 0.0}
@@ -728,7 +972,9 @@ def display_auswertung_page():
                         eeg_results.append(baseline_result)
                         for i, segment in enumerate(song_segments):
                             phase_name = chrono_names[i] if i < len(chrono_names) else f'Item {i+1} (Unbekannt)'
-                            cleaned_segment = clean_segment_with_context(segment, cleaning_level, short_event_seconds, global_long, global_trans, global_short)
+                            
+                            cleaned_segment = clean_segment_with_context(segment, cleaning_level, short_event_seconds, reaction_buffer, global_long, global_trans, global_short)
+                            
                             if cleaned_segment.empty: continue
                             eeg_results.append({'Phase': phase_name, **calculate_relaxation_ratios(compute_band_power(cleaned_segment, SAMPLING_FREQUENCY, EEG_CHANNELS))})
                         all_playlist_results[r_type] = {'preference_ranking': pref_names, 'eeg_results_df': pd.DataFrame(eeg_results)}
@@ -736,94 +982,223 @@ def display_auswertung_page():
                 st.session_state.analysis_results = results_collection
     
     elif not validation_errors and (not 'baseline' in eeg_dataframes or len(eeg_dataframes) <= 1):
-        st.info("Bitte laden Sie mindestens die Baseline und eine Playlist-Datei hoch, um die Analyse zu starten.")
+        st.info("Lade mindestens die Baseline und eine Playlist-Datei hoch, um die Analyse, mithilfe des User-Rankings, starten zu können.")
 
     if st.session_state.analysis_results:
         results_collection = st.session_state.analysis_results
         st.header("Gesamtanalyse aller Playlists")
+        
+        # Tabs für Reinigungs-Level
         level_tabs = st.tabs(CLEANING_LEVELS)
+        
         for i, cleaning_level in enumerate(CLEANING_LEVELS):
             with level_tabs[i]:
                 all_playlist_results = results_collection.get(cleaning_level, {})
-                if not all_playlist_results: st.warning(f"Keine Ergebnisse für Level '{cleaning_level}'."); continue
+                if not all_playlist_results: 
+                    st.warning(f"Keine Ergebnisse für Level '{cleaning_level}'.")
+                    continue
 
-                with st.expander(f"🎯 Gesamt-Übereinstimmung ({cleaning_level})", expanded=True):
-                    for r_type, data in all_playlist_results.items():
-                        st.subheader(f"Auswertung für: {r_type.replace('_', ' ').title()}")
-                        results_df = data['eeg_results_df']; preference_item_names = data['preference_ranking']
+                # --- Playlist Tabs ---
+                playlist_keys = list(all_playlist_results.keys())
+                playlist_labels = [k.replace('_', ' ').title() for k in playlist_keys]
+                
+                if not playlist_labels: continue
+                
+                pl_tabs = st.tabs(playlist_labels)
+                
+                for idx, pl_key in enumerate(playlist_keys):
+                    data = all_playlist_results[pl_key]
+                    with pl_tabs[idx]:
+                        results_df = data['eeg_results_df']
+                        preference_item_names = data['preference_ranking'] 
+                        
+                        if results_df.empty: 
+                            st.warning("Keine EEG-Daten.")
+                            continue
+                        
+                        eeg_items_set = set(results_df['Phase'])
+                        common_items_user_order = [item for item in preference_item_names if item in eeg_items_set]
+                        
+                        if not common_items_user_order:
+                            st.warning("Keine Übereinstimmung zwischen User-Ranking und EEG-Daten.")
+                            continue
+
                         metrics = ['Alpha/Beta Verhältnis', 'Theta/Beta Verhältnis', '(Alpha+Theta)/Beta Verhältnis']
-                        eeg_items = set(results_df['Phase']); pref_items = set(preference_item_names)
-                        common_items = list(eeg_items.intersection(pref_items))
+                        num_items = len(common_items_user_order)
                         
-                        if not common_items: st.error(f"Keine übereinstimmenden Items gefunden ({r_type})."); continue
-                        filtered_pref_ranking = [item for item in preference_item_names if item in common_items]
-                        filtered_eeg_df = results_df[results_df['Phase'].isin(common_items)]
-                        num_items = len(filtered_pref_ranking)
-                        if num_items == 0: continue
-
-                        eeg_rankings = {metric: filtered_eeg_df.sort_values(by=metric, ascending=False)['Phase'].tolist() for metric in metrics}
-                        individual_matches = {metric: 0 for metric in metrics}
-                        total_match_ranks = 0; theoretical_max_score = num_items
-                        
-                        for idx in range(num_items):
-                            user_item = filtered_pref_ranking[idx]
-                            rank_has_match = False
-                            eeg_suggestions_at_rank = []
-                            for metric in metrics:
-                                if idx < len(eeg_rankings[metric]):
-                                    eeg_item = eeg_rankings[metric][idx]; eeg_suggestions_at_rank.append(eeg_item)
-                                    if user_item == eeg_item: individual_matches[metric] += 1; rank_has_match = True
-                            if rank_has_match: total_match_ranks += 1
-                            bonus = len(eeg_suggestions_at_rank) - len(set(eeg_suggestions_at_rank)); theoretical_max_score += bonus
-                        
-                        total_green_fields_score = sum(individual_matches.values())
-                        dominant_metric = determine_dominant_metric(individual_matches)
-                        interpretations = {'Alpha/Beta Verhältnis': "Du assoziierst Entspannung am ehesten mit einem Zustand **wacher Aufmerksamkeit**.", 'Theta/Beta Verhältnis': "Du assoziierst Entspannung am ehesten mit einem **tiefen, meditativen Zustand**, der an Schläfrigkeit grenzt.", '(Alpha+Theta)/Beta Verhältnis': "Du assoziierst Entspannung am ehesten mit einer **ausgeglichenen Mischung** aus wacher und tiefer Ruhe."}
-                        interpretation_text = interpretations.get(dominant_metric, "Keine klare Tendenz erkennbar.") if dominant_metric else "Keine Treffer zur Interpretation gefunden."
-                        
-                        metric_cols = st.columns(2)
-                        metric_cols[0].metric(label="Gesamt-Trefferquote", value=f"{total_match_ranks}/{num_items}", help="Ein 'Treffer' bedeutet, dass mindestens ein EEG-Ranking mit Deinem Ranking auf dieser Position übereinstimmt.")
-                        metric_cols[1].metric(label="Punktzahl vs theoretische Max.", value=f"{total_green_fields_score}/{theoretical_max_score}", help="Zeigt die erreichte Punktzahl (Summe aller Übereinstimmungen) im Verhältnis zur theoretisch maximalen Punktzahl. Die Maximalpunktzahl erhöht sich für jede Übereinstimmung zwischen den EEG-Rankings selbst.")
-                        st.markdown(f"**Interpretation:** {interpretation_text}")
-                        st.markdown("Detaillierte Treffer pro Metrik:")
-                        score_cols = st.columns(3)
-                        for idx, metric in enumerate(metrics):
-                            with score_cols[idx]: st.metric(label=f"{metric.replace(' Verhältnis', '')}", value=f"{individual_matches[metric]}/{num_items}")
-                        st.markdown("---")
-
-                with st.expander(f"📊 Detaillierte Ergebnisse ({cleaning_level})", expanded=True):
-                    playlist_tabs = st.tabs([r_type.replace('_', ' ').title() for r_type in all_playlist_results.keys()])
-                    for idx, (r_type, data) in enumerate(all_playlist_results.items()):
-                        with playlist_tabs[idx]:
-                            results_df = data['eeg_results_df']; preference_item_names = data['preference_ranking']
-                            if results_df.empty: st.warning("Keine Daten."); continue
+                        # --- ERWEITERTE LOGIK-FUNKTION ---
+                        def calculate_tab_content(use_optimization):
+                            """
+                            Berechnet Scores und Tabelle.
+                            use_optimization = False -> Striktes Sortieren nach Messwert.
+                            use_optimization = True  -> Sortieren mit Toleranz (Threshold) zugunsten des Users.
+                            """
                             
-                            st.subheader("Konsolidiertes EEG-Gesamtranking")
-                            metrics = ['Alpha/Beta Verhältnis', 'Theta/Beta Verhältnis', '(Alpha+Theta)/Beta Verhältnis']
-                            ranking_data = {f"Ranking nach {m}": [f"**{row['Phase']}** :blue[[{row[m]:.3f}]]" for _, row in results_df.sort_values(by=m, ascending=False).iterrows()] for m in metrics}
-                            ranking_df = pd.DataFrame(ranking_data); ranking_df.index = np.arange(1, len(ranking_df) + 1); st.table(ranking_df)
+                            total_match_ranks = 0 
+                            individual_matches = {m: 0 for m in metrics}
+                            theoretical_max = num_items
                             
-                            st.subheader("Vergleich: Subjektives Ranking vs. EEG-Rankings")
-                            eeg_items_set = set(results_df['Phase']); common_items_pref_order = [item for item in preference_item_names if item in eeg_items_set]
-                            if not common_items_pref_order: st.warning("Keine übereinstimmenden Items zum Vergleich gefunden."); continue
+                            comp_data = {
+                                'Rang': range(1, num_items + 1), 
+                                'Dein Ranking': common_items_user_order
+                            }
                             
-                            comparison_df = pd.DataFrame({'Nutzer-Ranking': common_items_pref_order})
-                            eeg_rankings = {m: results_df.sort_values(by=m, ascending=False)['Phase'].tolist() for m in metrics}
+                            row_eeg_items = {m: [] for m in metrics}
+                            
+                            # 1. Listen vorbereiten
+                            eeg_sorted_lists = {}
                             for m in metrics:
-                                col_name = f"EEG: {m.replace(' Verhältnis', '').replace('Alpha/Beta', 'A/B').replace('(Alpha+Theta)/Beta', '(A+T)/B').replace('Theta/Beta', 'T/B')}"
-                                eeg_ranked_common = [item for item in eeg_rankings[m] if item in common_items_pref_order]
-                                comparison_df[col_name] = pd.Series(eeg_ranked_common, index=comparison_df.index[:len(eeg_ranked_common)])
+                                vals = results_df[m].values
+                                thresh = calculate_dynamic_threshold(vals, factor=0.5)
+                                
+                                if use_optimization:
+                                    # Optimiert: Nutzt Threshold zum "Cluster-Tausch"
+                                    eeg_sorted_lists[m] = get_sehr_fair_ranking_order(results_df, m, common_items_user_order, thresh)
+                                else:
+                                    # Strikt: Ignoriert Threshold, sortiert rein numerisch
+                                    eeg_sorted_lists[m] = get_strict_ranking_order(results_df, m)
+                                
+                                eeg_sorted_lists[m] = [x for x in eeg_sorted_lists[m] if x in common_items_user_order]
 
-                            comparison_df.index = np.arange(1, len(comparison_df) + 1); comparison_df.index.name = "Rang"
-                            def highlight_matches(column):
-                                user_ranking = comparison_df['Nutzer-Ranking']; is_match = column == user_ranking
-                                return ['background-color: #28a745; color: white' if v else 'background-color: #dc3545; color: white' for v in is_match]
-                            st.dataframe(comparison_df.style.apply(highlight_matches, subset=[c for c in comparison_df.columns if c.startswith('EEG:')]))
-        
+                            # 2. Iteration über die Ränge
+                            for i in range(num_items):
+                                user_item = common_items_user_order[i]
+                                row_has_any_match = False
+                                suggestions_at_rank = []
+                                
+                                for m in metrics:
+                                    eeg_list = eeg_sorted_lists[m]
+                                    if i < len(eeg_list):
+                                        eeg_item = eeg_list[i]
+                                        suggestions_at_rank.append(eeg_item)
+                                        row_eeg_items[m].append(eeg_item)
+                                        
+                                        if eeg_item == user_item:
+                                            individual_matches[m] += 1
+                                            row_has_any_match = True
+                                    else:
+                                        row_eeg_items[m].append("-")
+                                
+                                if row_has_any_match:
+                                    total_match_ranks += 1
+                                
+                                unique_suggestions = set(suggestions_at_rank)
+                                bonus = len(suggestions_at_rank) - len(unique_suggestions)
+                                theoretical_max += bonus
+
+                            dominant = determine_dominant_metric(individual_matches)
+                            interpretations = {
+                                'Alpha/Beta Verhältnis': "Du assoziierst Entspannung am ehesten mit einem Zustand **wacher Aufmerksamkeit**.", 
+                                'Theta/Beta Verhältnis': "Du assoziierst Entspannung am ehesten mit einem **tiefen, meditativen Zustand**, der an Schläfrigkeit grenzt.", 
+                                '(Alpha+Theta)/Beta Verhältnis': "Du assoziierst Entspannung am ehesten mit einer **ausgeglichenen Mischung** aus wacher und tiefer Ruhe."
+                            }
+                            interp_text = interpretations.get(dominant, "Keine klare Tendenz.") if dominant else "Zu wenige Treffer."
+
+                            for m in metrics:
+                                short_m = m.replace(' Verhältnis', '').replace('Alpha', 'A').replace('Theta', 'T').replace('Beta', 'B')
+                                comp_data[f"EEG {short_m}"] = row_eeg_items[m]
+                                
+                            df_res = pd.DataFrame(comp_data).set_index('Rang')
+                            
+                            stats = {
+                                'total_ranks': total_match_ranks,
+                                'total_max': theoretical_max,
+                                'green_score': sum(individual_matches.values()),
+                                'individual': individual_matches,
+                                'interpretation': interp_text
+                            }
+                            return df_res, stats
+
+                        # --- UI START ---
+                        
+                        # HIER WURDEN DIE NAMEN ANGEPASST:
+                        ana_tab1, ana_tab2 = st.tabs(["Strikt (Numerisch)", "Optimiert (Mit Toleranz)"])
+                        
+                        def display_score_block(stats_dict):
+                            col1, col2 = st.columns(2)
+                            col1.metric("Gesamt-Trefferquote (Zeilen)", f"{stats_dict['total_ranks']} / {num_items}")
+                            col2.metric("Punktzahl vs. theoretische Max.", f"{stats_dict['green_score']} / {stats_dict['total_max']}")
+                            st.markdown(f"**Interpretation:** {stats_dict['interpretation']}")
+                            
+                            st.caption("Detaillierte Treffer pro Metrik:")
+                            c_s1, c_s2, c_s3 = st.columns(3)
+                            indiv = stats_dict['individual']
+                            c_s1.metric("Alpha/Beta", f"{indiv['Alpha/Beta Verhältnis']}/{num_items}")
+                            c_s2.metric("Theta/Beta", f"{indiv['Theta/Beta Verhältnis']}/{num_items}")
+                            c_s3.metric("(A+T)/Beta", f"{indiv['(Alpha+Theta)/Beta Verhältnis']}/{num_items}")
+                            st.divider()
+
+                        def highlight_fair(x):
+                            df = pd.DataFrame('', index=x.index, columns=x.columns)
+                            user_col = x['Dein Ranking']
+                            for col in x.columns:
+                                if col.startswith('EEG'):
+                                    mask = x[col] == user_col
+                                    df[col] = np.where(mask, 'background-color: #28a745; color: white', 'background-color: #dc3545; color: white')
+                            return df
+
+                        # --- TAB 1: STRIKT ---
+                        with ana_tab1:
+                            df_strict, stats_strict = calculate_tab_content(use_optimization=False)
+                            display_score_block(stats_strict)
+                            st.caption("Vergleich: **Strikte Logik**. Sortierung rein nach Messwert (höchster gewinnt). Keine Toleranz für knappe Unterschiede.")
+                            st.dataframe(df_strict.style.apply(highlight_fair, axis=None), width='stretch')
+
+                        # --- TAB 2: OPTIMIERT ---
+                        with ana_tab2:
+                            df_opt, stats_opt = calculate_tab_content(use_optimization=True)
+                            
+                            delta_ranks = stats_opt['total_ranks'] - stats_strict['total_ranks']
+                            display_score_block(stats_opt)
+                            if delta_ranks > 0:
+                                st.success(f"📈 Durch Berücksichtigung des Thresholds (Toleranz) wurden **{delta_ranks}** zusätzliche Übereinstimmungen gefunden (physiologisch gleichwertige Items getauscht).")
+                            
+                            st.caption("Vergleich: **Optimierte Logik**. Werte innerhalb des Thresholds gelten als gleichwertig und werden so sortiert, dass sie deinem Ranking entsprechen.")
+                            st.dataframe(df_opt.style.apply(highlight_fair, axis=None), width='stretch')
+
+                        # --- EXPANDER: ROHDATEN ---
+                        st.markdown("###")
+                        with st.expander("📄 Konsolidiertes EEG Ranking (Rohwerte anzeigen)", expanded=False):
+                            st.info("ℹ️ **Berechnung des Thresholds (Toleranzwert):**\n"
+                                    "Der Wert berechnet sich dynamisch pro Verhältnis aus: "
+                                    "**Standardabweichung (aller Werte inkl. Baseline) × 0,5**.")
+                            
+                            ranking_data = {}
+                            for m in metrics:
+                                vals = results_df[m].values
+                                thresh = calculate_dynamic_threshold(vals, factor=0.5)
+                                sorted_df = results_df.sort_values(by=m, ascending=False)
+                                
+                                short_m_name = m.replace(' Verhältnis', '')
+                                col_name = f"{short_m_name}\n(Threshold: ±{thresh:.4f})"
+                                
+                                ranking_data[col_name] = [
+                                    f"**{row['Phase']}** ({row[m]:.4f})" 
+                                    for _, row in sorted_df.iterrows()
+                                ]
+                            
+                            max_len = max(len(v) for v in ranking_data.values())
+                            for k in ranking_data:
+                                ranking_data[k] += [""] * (max_len - len(ranking_data[k]))
+                                
+                            df_raw = pd.DataFrame(ranking_data)
+                            df_raw.index = range(1, len(df_raw) + 1)
+                            st.table(df_raw)
+
         st.markdown("---")
         st.subheader("💾 Gesamt-Report exportieren")
+        
         date_str = datetime.now().strftime('%d-%m-%y')
         safe_id = participant_id if participant_id != "Unbekannt" else "EEG_Analyse"
         export_filename = f"{safe_id}_{date_str}.html"
-        html_report = generate_html_report(results_collection, short_event_seconds, participant_id)
-        st.download_button(label="📄 Ergebnisse aller Level als HTML-Report herunterladen", data=html_report, file_name=export_filename, mime="text/html", use_container_width=True)
+        
+        html_report = generate_html_report(results_collection, short_event_seconds, reaction_buffer, participant_id)
+        
+        st.download_button(
+            label="📄 Ergebnisse als HTML-Report herunterladen", 
+            data=html_report, 
+            file_name=export_filename, 
+            mime="text/html", 
+            type="primary",
+            width='stretch'
+        )

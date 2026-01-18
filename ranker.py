@@ -63,7 +63,6 @@ if 'ranked_audio_2' not in st.session_state:
     AUDIO_ITEMS_DATA_2.insert(0, baseline_item_2)
     st.session_state['ranked_audio_2'] = AUDIO_ITEMS_DATA_2
 
-# NEU: Audio 3 (Shuffled)
 # Mapping: song5, song3, song8, song2, song6
 # Display Namen: Song 1 bis Song 5
 if 'ranked_audio_3' not in st.session_state:
@@ -368,7 +367,7 @@ if selected_tab == 'Dateneingabe & Ranking':
                 st.write("")
                 automation_csv_data = generate_automation_csv()
                 st.download_button(
-                    label="📥 Trigger Automatisierungs CSV",
+                    label="📥 Trigger CSV",
                     data=automation_csv_data,
                     file_name=f"automation_export_{st.session_state.get('participant_id', 'NO_ID')}_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv",
